@@ -1,3 +1,7 @@
+# Evaluates language models on function composition problems from the CruxEval benchmark.
+# Tests the model's ability to understand and correctly compose multiple functions together,
+# analyzing patterns in successful and unsuccessful completions.
+
 #%%
 import polars as pl
 

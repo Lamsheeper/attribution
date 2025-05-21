@@ -1,4 +1,6 @@
-#%% [markdown]
+# Evaluates language models on the CruxEval benchmark for code generation capabilities.
+# Supports various evaluation modes including standard inference, causal tracing, and
+# token-by-token analysis to attribute model performance.
 
 # Run causal tracing on {input, function, output} triplets.
 # Use olmo's DPO model. 
@@ -27,7 +29,7 @@ from pathlib import Path
 from nnsight import LanguageModel
 from bigcode_eval.tasks import get_task
 from bigcode_eval.tasks.cruxeval import CruxEval
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import time
 from tqdm import tqdm
 import argparse
@@ -36,18 +38,30 @@ import sys
 from attribution.utils import CruxEvalUtil, CausalTracingInput, causal_trace, format_template
 
 from guidance import models, gen, guidance
+import sys
+import os
+
+print("Python executable:", sys.executable)
+print("Python path:", sys.path)
+print("HF_HOME:", os.environ.get("HF_HOME"))
+print("HF_TOKEN:", os.environ.get("HF_TOKEN"))
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Evaluate CruxEval problems with a specified model')
-parser.add_argument('--model', type=str, default="allenai/OLMo-2-1124-7B-DPO", 
-                    help='Model to use for evaluation (default: allenai/OLMo-2-1124-7B-DPO)')
+parser.add_argument(
+    "--model",
+    type=str,
+    default="allenai/OLMo-2-1124-7B",
+    help="Model to use for evaluation (default: allenai/OLMo-2-1124-7B)",
+)
 parser.add_argument('--num_problems', type=int, default=800,
                     help='Number of problems to evaluate (default: 800)')
 parser.add_argument('--batch_size', type=int, default=8,
                     help='Batch size for evaluation (default: 8)')
 parser.add_argument('--output_dir', type=str, default="../data",
                     help='Directory to save results (default: ../data)')
-parser.add_argument('--revision', type=str, default="main",)
+parser.add_argument('--revision', type=str, default="main",
+                    help='Model revision to use (default: main)')
 
 # Check if running as script or in interactive mode
 if not sys.argv[0].endswith('ipykernel_launcher.py'):
@@ -55,6 +69,10 @@ if not sys.argv[0].endswith('ipykernel_launcher.py'):
 else:
     # Default values for interactive mode
     args = parser.parse_args([])
+
+
+# Initialize CruxEvalUtil and model
+ce = CruxEvalUtil()
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_default_device(device)
@@ -73,7 +91,7 @@ if torch.cuda.is_available():
 
 # Model paths
 MODELS = {
-    "base": "allenai/OLMo2-7B-1124",
+    "base": "allenai/OLMo-2-1124-7B",
     "sft": "allenai/OLMo-2-1124-7B-SFT",
     "dpo": "allenai/OLMo-2-1124-7B-DPO",
     "instruct": "allenai/OLMo-2-1124-7B-Instruct",
@@ -102,24 +120,45 @@ for key, value in MODELS.items():
         model_short_name = key
         break
 
-# Initialize CruxEvalUtil and model
-ce = CruxEvalUtil()
 
-#%%
-print(f"Loading model: {model_name}")
+# Set up cache paths
+PERMANENT_CACHE = Path("/share/datasets/huggingface_hub")
+HF_CACHE = Path(os.environ.get("HF_HOME", Path.home() / ".cache/huggingface"))
+
 revision = args.revision
-#%%
-# Load tokenizer with optimized settings
-tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side='left', use_fast=True, revision=revision)
+print(f"Loading model: {model_name}")
+print(f"Loading revision: {revision}")
 
+# Check permanent cache first
+model_cache_path = PERMANENT_CACHE / f"models--{model_name.replace('/', '-')}/snapshots/{revision}"
+if model_cache_path.exists():
+    print(f"Found model in permanent cache at {model_cache_path}")
+    # Copy to HF cache if needed
+    hf_model_path = HF_CACHE / f"models--{model_name.replace('/', '-')}/snapshots/{revision}"
+    if not hf_model_path.exists():
+        print("Copying model to HF cache...")
+        hf_model_path.parent.mkdir(parents=True, exist_ok=True)
+        os.system(f"cp -r {model_cache_path} {hf_model_path}")
+
+# Load tokenizer with optimized settings
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    padding_side='left',
+    use_fast=True,
+    trust_remote_code=True
+)
+
+CONFIG = AutoConfig.from_pretrained(model_name)
 # Initialize model with optimized settings
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
     device_map="auto",  # Automatically distribute across available GPUs
     torch_dtype=torch.bfloat16,  # Use bfloat16 for faster computation
     low_cpu_mem_usage=True,  # Optimize CPU memory usage
-    use_cache=True,  # Enable KV cache for faster generation
-    revision=revision
+    # use_cache=True,  # Enable KV cache for faster generation
+    revision=revision,
+    config=CONFIG,
+    trust_remote_code=True
 )
 
 # Set model to evaluation mode
@@ -131,7 +170,6 @@ if torch.cuda.is_available():
     total_memory: float = torch.cuda.mem_get_info()[1] / 1024**3  # Convert to GB
     used_memory: float = total_memory - free_memory
     print(f"GPU memory after loading model: {used_memory:.2f}GB used / {total_memory:.2f}GB total ({free_memory:.2f}GB free)")
-
 #%%
 prompt, true_in, true_out = ce.output_full(2)
 formatted_prompt = prompt.replace('{input}', true_in).replace('{output}', '')

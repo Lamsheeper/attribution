@@ -1,3 +1,7 @@
+# Aggregates and analyzes results from multiple code generation benchmarks.
+# Combines performance data across different evaluation datasets, providing comprehensive
+# metrics and comparative analysis to identify patterns in model capabilities.
+
 #%%
 import pandas as pd
 import numpy as np

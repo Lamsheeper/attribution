@@ -1,3 +1,7 @@
+# Compares pass rates of different models across multiple coding benchmarks.
+# Creates visualizations to highlight performance differences between models, 
+# analyzing factors affecting code generation quality and task completion rates.
+
 #%%
 import os
 import json

@@ -1,3 +1,7 @@
+# Trains and evaluates a language model on a single code generation benchmark.
+# Handles the full pipeline from data preparation through training to evaluation,
+# providing a focused assessment of model capabilities on a specific benchmark.
+
 import subprocess
 from pathlib import Path
 import transformers

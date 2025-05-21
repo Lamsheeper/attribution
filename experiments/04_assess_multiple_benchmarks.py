@@ -1,3 +1,7 @@
+# Evaluates language model performance across multiple code generation benchmarks.
+# Implements a comprehensive evaluation framework that runs models through various
+# coding tasks, collecting and analyzing performance metrics like pass@k scores.
+
 #%%
 import json
 import os

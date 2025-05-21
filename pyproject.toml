@@ -49,4 +49,4 @@ build-backend = "hatchling.build"
 packages = ["src/attribution"]
 
 [tool.uv.sources]
-bigcode-eval = { path = "/home/lofty/code_llm/bigcode-evaluation-harness", editable = true }
+bigcode-eval = { path = "/share/u/lofty/code_llm/bigcode-evaluation-harness", editable = true }

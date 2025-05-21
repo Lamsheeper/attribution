@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
+Plot results from CruxEval benchmark evaluations.
+
 Generate plots from CruxEval results for OLMo models.
 This script creates bar charts, heatmaps, and line plots similar to those in 04_assess_multiple_benchmarks.py.
 """

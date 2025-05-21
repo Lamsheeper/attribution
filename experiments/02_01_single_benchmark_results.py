@@ -1,4 +1,7 @@
-#%%
+# Processes and analyzes results from single benchmark evaluations of code models.
+# Loads evaluation data, extracts performance metrics, and generates summary statistics
+# to provide insights into model performance on specific code tasks.
+
 from fastcore.all import Path
 from attribution import ROOT_PATH
 import json

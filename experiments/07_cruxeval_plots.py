@@ -1,3 +1,7 @@
+# Creates visualizations specifically for CruxEval benchmark results across different models.
+# Generates plots showing correctness patterns, comparative model performance, and 
+# problem-specific analytics to identify strengths and weaknesses in code generation.
+
 from pathlib import Path
 import json
 from bigcode_eval.tasks import get_task

@@ -1,3 +1,7 @@
+# Analyzes detailed results from CruxEval benchmark evaluations, focusing on correctness patterns.
+# Performs statistical analysis on model outputs, identifying frequently correct/incorrect problems
+# and extracting insights about model capabilities in code generation.
+
 from pathlib import Path
 import json
 from bigcode_eval.tasks import get_task
