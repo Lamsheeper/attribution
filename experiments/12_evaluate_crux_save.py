@@ -339,7 +339,7 @@ def evaluate_problem(model, tokenizer, problem_id: int, max_tokens: int = 100) -
         return False, str(e), f"Error: {str(e)}"
 
 # Function to evaluate a batch of problems using a single forward pass
-def evaluate_batch(model, tokenizer, problem_ids: list[int], max_tokens: int = 100, persona: str = "") -> list[tuple[bool, str, str]]:
+def evaluate_batch(model, tokenizer, problem_ids: list[int], max_tokens: int = 100, persona: str = "") -> list[tuple[bool, str, str, str, list]]:
     """
     Evaluate a batch of CruxEval problems in a single forward pass.
     
@@ -350,7 +350,7 @@ def evaluate_batch(model, tokenizer, problem_ids: list[int], max_tokens: int = 1
         max_tokens: Maximum number of tokens to generate
         persona: Persona to use for evaluation
     Returns:
-        List of tuples (is_correct, generated_output, true_output) for each problem
+        List of tuples (is_correct, generated_output, true_output, token_logprobs) for each problem
     """
     try:
         # Prepare all prompts
@@ -397,13 +397,31 @@ def evaluate_batch(model, tokenizer, problem_ids: list[int], max_tokens: int = 1
                 pad_token_id=tokenizer.eos_token_id,
                 use_cache=True,
                 early_stopping=False,    # No early stopping with num_beams=1
+                output_scores=True,      # Get the logits
+                return_dict_in_generate=True  # Return full generation info including scores
             )
+        
+        # Extract scores from generation
+        sequences = outputs.sequences
+        
+        # Compute transition scores using the built-in HuggingFace method
+        try:
+            transition_scores = model.compute_transition_scores(
+                sequences=outputs.sequences,
+                scores=outputs.scores,
+                normalize_logits=True  # Get log probabilities
+            )
+        except (AttributeError, RuntimeError) as e:
+            # Some models don't support compute_transition_scores
+            print(f"Warning: compute_transition_scores failed: {e}")
+            # Fall back to our custom method
+            transition_scores = None
         
         # Process results
         batch_results = []
-        for i, (output, true_out, problem_id, true_in) in enumerate(zip(outputs, true_outputs, problem_ids, problem_inputs)):
+        for i, (output, true_out, problem_id, true_in) in enumerate(zip(sequences, true_outputs, problem_ids, problem_inputs)):
             # Get the original input length for this example (subtract 1 for correct slicing)
-            input_length = input_ids_lengths[i] 
+            input_length = input_ids_lengths[i] - 1
             
             # Extract only the newly generated tokens for this example
             generated_tokens = output[input_length:]
@@ -422,6 +440,111 @@ def evaluate_batch(model, tokenizer, problem_ids: list[int], max_tokens: int = 1
             # Check if output matches
             is_correct = generated.strip() == true_out.strip()
             
+            # Extract logprobs for this sample using transition scores if available
+            token_logprobs = []
+            
+            if transition_scores is not None:
+                # Get the transition scores for this sample (sequence)
+                sample_scores = transition_scores[i]
+                
+                # Only consider scores for tokens after the input
+                # The +1 offset is because transition_scores has one less element than generated tokens
+                # (the first token has no transition)
+                relevant_scores = sample_scores[max(0, input_length - output.shape[0] + 1):]
+                
+                # Filter out padding tokens and special tokens at the end
+                token_list = output[input_length:].tolist()
+                filtered_scores = []
+                
+                # Make sure token_list and relevant_scores align in length
+                min_len = min(len(token_list), len(relevant_scores))
+                for idx in range(min_len):
+                    score = relevant_scores[idx]
+                    token_id = token_list[idx]
+                    
+                    # Skip padding tokens (usually eos_token_id) and tokens at the end that might cause -inf
+                    if token_id == tokenizer.pad_token_id or token_id == tokenizer.eos_token_id:
+                        continue
+                        
+                    # Once we encounter a really low score (likely padding or end), stop
+                    if score.item() < -15 and idx > min_len // 2:  # Only apply in the latter half
+                        break
+                        
+                    # Only include valid scores
+                    if not (torch.isinf(score) or torch.isnan(score)):
+                        filtered_scores.append(score.item())
+                    else:
+                        filtered_scores.append(-20.0)  # Use fallback
+                
+                token_logprobs = filtered_scores
+            else:
+                # Extract token logprobs more carefully using our fallback method
+                try:
+                    # Check that we have scores
+                    if hasattr(outputs, 'scores') and len(outputs.scores) > 0:
+                        # Map from score index to sequence index
+                        for score_idx, score_tensor in enumerate(outputs.scores):
+                            # Make sure this sample index is valid for this score tensor
+                            if i < score_tensor.size(0):
+                                # Get the token id that was actually generated at this step
+                                seq_idx = input_length + score_idx + 1
+                                
+                                # Only process if the index is within bounds
+                                if seq_idx < output.size(0):
+                                    token = output[seq_idx].item()
+                                    
+                                    # Get the log probability for this token
+                                    log_softmax = F.log_softmax(score_tensor[i], dim=-1)
+                                    
+                                    # Only add valid logprobs
+                                    if token < log_softmax.size(-1):
+                                        logprob = log_softmax[token].item()
+                                        # Add only non-infinite logprobs
+                                        if not torch.isinf(torch.tensor(logprob)) and not torch.isnan(torch.tensor(logprob)):
+                                            token_logprobs.append(logprob)
+                                        else:
+                                            # Use a small negative value instead of -Infinity
+                                            token_logprobs.append(-20.0)
+                                    else:
+                                        # Token out of vocabulary range, use fallback value
+                                        token_logprobs.append(-20.0)
+                except Exception as e:
+                    print(f"Error extracting logprobs for problem {problem_id}: {e}")
+            
+            # Set a minimum logprob value to avoid -infinity
+            token_logprobs = [-20.0 if torch.isinf(torch.tensor(lp)) or torch.isnan(torch.tensor(lp)) else lp for lp in token_logprobs]
+            
+            # Calculate mean logprob safely
+            if token_logprobs:
+                mean_logprob = sum(token_logprobs) / len(token_logprobs)
+            else:
+                mean_logprob = -20.0  # Use a default negative value
+            
+            # Calculate logprob statistics
+            if token_logprobs:
+                # Replace any remaining infinity values with our fallback
+                safe_logprobs = [-20.0 if torch.isinf(torch.tensor(lp)) or torch.isnan(torch.tensor(lp)) else lp for lp in token_logprobs]
+                
+                logprob_stats = {
+                    "count": len(safe_logprobs),
+                    "mean": sum(safe_logprobs) / len(safe_logprobs) if safe_logprobs else -20.0,
+                    "min": min(safe_logprobs) if safe_logprobs else -20.0,
+                    "max": max(safe_logprobs) if safe_logprobs else -20.0,
+                    "median": sorted(safe_logprobs)[len(safe_logprobs) // 2] if safe_logprobs else -20.0,
+                    "high_confidence_ratio": sum(1 for lp in safe_logprobs if lp > -0.1) / len(safe_logprobs) if safe_logprobs else 0.0,
+                    "low_confidence_ratio": sum(1 for lp in safe_logprobs if lp < -1.0) / len(safe_logprobs) if safe_logprobs else 1.0
+                }
+            else:
+                logprob_stats = {
+                    "count": 0,
+                    "mean": -20.0,
+                    "min": -20.0,
+                    "max": -20.0,
+                    "median": -20.0,
+                    "high_confidence_ratio": 0.0,
+                    "low_confidence_ratio": 1.0
+                }
+            
             # Print detailed info for correct outputs or sample problems
             if is_correct or problem_id % 50 == 0:
                 print(f"\nProblem ID: {problem_id}")
@@ -430,15 +553,18 @@ def evaluate_batch(model, tokenizer, problem_ids: list[int], max_tokens: int = 1
                 print(f"Extracted Output: {generated}")
                 print(f"Expected: {true_out}")
                 print(f"Correct: {is_correct}")
+                if token_logprobs:
+                    print(f"Mean logprob: {mean_logprob:.4f}")
+                    print(f"High confidence token ratio: {logprob_stats['high_confidence_ratio']:.2f}")
             
-            batch_results.append((is_correct, full_generated_text, generated, true_out))
+            batch_results.append((is_correct, full_generated_text, generated, true_out, token_logprobs, logprob_stats))
         
         return batch_results
     
     except Exception as e:
         print(f"Error evaluating batch {problem_ids}: {str(e)}")
         # Return failed results for each problem in the batch
-        return [(False, str(e), f"Error: {str(e)}") for _ in problem_ids]
+        return [(False, str(e), f"Error: {str(e)}", "", [], {}) for _ in problem_ids]
 
 # Function to evaluate a batch of problems with multiple samples per problem
 def evaluate_batch_with_sampling(model, tokenizer, problem_ids: list[int], 
@@ -537,12 +663,12 @@ def evaluate_batch_with_sampling(model, tokenizer, problem_ids: list[int],
                 # Get input length for this problem
                 input_length = input_ids_lengths[i] - 1
                 
-                # Generate multiple samples
+                # Generate multiple samples with logprobs
                 with torch.no_grad():
                     generated_outputs = model.generate(
                         problem_input_ids,
                         attention_mask=problem_attention_mask,
-                        max_new_tokens=100,  # Set back to 100
+                        max_new_tokens=max_tokens,
                         do_sample=True,  # Enable sampling
                         num_return_sequences=num_samples,  # Return multiple sequences
                         num_beams=1,  # No beam search
@@ -551,19 +677,41 @@ def evaluate_batch_with_sampling(model, tokenizer, problem_ids: list[int],
                         pad_token_id=tokenizer.eos_token_id,
                         use_cache=True,
                         early_stopping=False,  # Not needed with num_beams=1
+                        output_scores=True,    # Get the logits
+                        return_dict_in_generate=True  # Return full generation info including scores
                     )
                 
                 # Process each sample
                 sample_results = []
                 any_correct = False
                 best_sample_idx = -1
+                highest_logprob_idx = -1
                 correct_count = 0
+                highest_mean_logprob = float('-inf')
+                all_mean_logprobs = []
+                
+                # Get sequences and compute transition scores
+                sequences = generated_outputs.sequences
+                
+                # Compute transition scores using the built-in HuggingFace method
+                # This handles the token probability calculations correctly
+                try:
+                    transition_scores = model.compute_transition_scores(
+                        sequences=generated_outputs.sequences,
+                        scores=generated_outputs.scores,
+                        normalize_logits=True  # Get log probabilities
+                    )
+                except (AttributeError, RuntimeError) as e:
+                    # Some models don't support compute_transition_scores
+                    print(f"Warning: compute_transition_scores failed: {e}")
+                    # Fall back to our custom method
+                    transition_scores = None
                 
                 for j in range(num_samples):
                     # Get generated tokens for this sample
-                    sample_output = generated_outputs[j]
+                    sample_output = sequences[j]
                     
-                    # Extract only newly generated tokens
+                    # Extract only newly generated tokens (after input)
                     generated_tokens = sample_output[input_length:]
                     full_generated_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
                     
@@ -583,6 +731,118 @@ def evaluate_batch_with_sampling(model, tokenizer, problem_ids: list[int],
                         if not any_correct:  # Only update for the first correct sample
                             any_correct = True
                             best_sample_idx = j
+
+                    # Extract logprobs for this sample using transition scores if available
+                    token_logprobs = []
+                    
+                    if transition_scores is not None:
+                        # Get the transition scores for this sample (sequence)
+                        sample_scores = transition_scores[j]
+                        
+                        # Only consider scores for tokens after the input
+                        # The +1 offset is because transition_scores has one less element than generated tokens
+                        # (the first token has no transition)
+                        relevant_scores = sample_scores[max(0, input_length - sample_output.shape[0] + 1):]
+                        
+                        # Filter out padding tokens and special tokens at the end
+                        token_list = sample_output[input_length:].tolist()
+                        filtered_scores = []
+                        
+                        # Make sure token_list and relevant_scores align in length
+                        min_len = min(len(token_list), len(relevant_scores))
+                        for idx in range(min_len):
+                            score = relevant_scores[idx]
+                            token_id = token_list[idx]
+                            
+                            # Skip padding tokens (usually eos_token_id) and tokens at the end that might cause -inf
+                            if token_id == tokenizer.pad_token_id or token_id == tokenizer.eos_token_id:
+                                continue
+                                
+                            # Once we encounter a really low score (likely padding or end), stop
+                            if score.item() < -15 and idx > min_len // 2:  # Only apply in the latter half
+                                break
+                                
+                            # Only include valid scores
+                            if not (torch.isinf(score) or torch.isnan(score)):
+                                filtered_scores.append(score.item())
+                            else:
+                                filtered_scores.append(-20.0)  # Use fallback
+                        
+                        token_logprobs = filtered_scores
+                    else:
+                        # Fall back to our custom method for models that don't support compute_transition_scores
+                        # Extract token logprobs more carefully
+                        try:
+                            # Check that we have scores
+                            if hasattr(generated_outputs, 'scores') and len(generated_outputs.scores) > 0:
+                                # Map from score index to sequence index
+                                for score_idx, score_tensor in enumerate(generated_outputs.scores):
+                                    # Make sure this sample index is valid for this score tensor
+                                    if j < score_tensor.size(0):
+                                        # Get the token id that was actually generated at this step
+                                        seq_idx = input_length + score_idx + 1
+                                        
+                                        # Only process if the index is within bounds
+                                        if seq_idx < sample_output.size(0):
+                                            token = sample_output[seq_idx].item()
+                                            
+                                            # Get the log probability for this token
+                                            log_softmax = F.log_softmax(score_tensor[j], dim=-1)
+                                            
+                                            # Only add valid logprobs
+                                            if token < log_softmax.size(-1):
+                                                logprob = log_softmax[token].item()
+                                                # Add only non-infinite logprobs
+                                                if not torch.isinf(torch.tensor(logprob)) and not torch.isnan(torch.tensor(logprob)):
+                                                    token_logprobs.append(logprob)
+                                                else:
+                                                    # Use a small negative value instead of -Infinity
+                                                    token_logprobs.append(-20.0)
+                                            else:
+                                                # Token out of vocabulary range, use fallback value
+                                                token_logprobs.append(-20.0)
+                        except Exception as e:
+                            print(f"Error extracting logprobs for problem {problem_id}, sample {j}: {e}")
+                    
+                    # Set a minimum logprob value to avoid -infinity
+                    token_logprobs = [-20.0 if torch.isinf(torch.tensor(lp)) or torch.isnan(torch.tensor(lp)) else lp for lp in token_logprobs]
+                    
+                    # Calculate mean logprob more safely
+                    if token_logprobs:
+                        mean_logprob = sum(token_logprobs) / len(token_logprobs)
+                    else:
+                        mean_logprob = -20.0  # Use a default negative value
+                    all_mean_logprobs.append(mean_logprob)
+                    
+                    # Track sample with highest logprob
+                    if mean_logprob > highest_mean_logprob:
+                        highest_mean_logprob = mean_logprob
+                        highest_logprob_idx = j
+                    
+                    # Calculate logprob statistics
+                    if token_logprobs:
+                        # Replace any remaining infinity values with our fallback
+                        safe_logprobs = [-20.0 if torch.isinf(torch.tensor(lp)) or torch.isnan(torch.tensor(lp)) else lp for lp in token_logprobs]
+                        
+                        logprob_stats = {
+                            "count": len(safe_logprobs),
+                            "mean": sum(safe_logprobs) / len(safe_logprobs) if safe_logprobs else -20.0,
+                            "min": min(safe_logprobs) if safe_logprobs else -20.0,
+                            "max": max(safe_logprobs) if safe_logprobs else -20.0,
+                            "median": sorted(safe_logprobs)[len(safe_logprobs) // 2] if safe_logprobs else -20.0,
+                            "high_confidence_ratio": sum(1 for lp in safe_logprobs if lp > -0.1) / len(safe_logprobs) if safe_logprobs else 0.0,
+                            "low_confidence_ratio": sum(1 for lp in safe_logprobs if lp < -1.0) / len(safe_logprobs) if safe_logprobs else 1.0
+                        }
+                    else:
+                        logprob_stats = {
+                            "count": 0,
+                            "mean": -20.0,
+                            "min": -20.0,
+                            "max": -20.0,
+                            "median": -20.0,
+                            "high_confidence_ratio": 0.0,
+                            "low_confidence_ratio": 1.0
+                        }
                     
                     # Add to sample results
                     sample_results.append({
@@ -590,19 +850,27 @@ def evaluate_batch_with_sampling(model, tokenizer, problem_ids: list[int],
                         "generated": generated,
                         "full_generated_text": full_generated_text,
                         "is_correct": is_correct,
-                        "num_tokens": len(generated_tokens)
+                        "token_logprobs": token_logprobs,
+                        "mean_logprob": mean_logprob,
+                        "num_tokens": len(generated_tokens),
+                        "logprob_stats": logprob_stats
                     })
                 
                 # Calculate correct rate
                 correct_rate = correct_count / num_samples if num_samples > 0 else 0.0
+                
+                # Calculate average logprob across all samples
+                avg_logprob = sum(all_mean_logprobs) / len(all_mean_logprobs) if all_mean_logprobs else -20.0
                 
                 # Add result for this problem
                 batch_results.append({
                     "problem_id": problem_id,
                     "any_correct": any_correct,
                     "best_sample_idx": best_sample_idx,
+                    "highest_logprob_idx": highest_logprob_idx,
                     "correct_count": correct_count,
                     "correct_rate": correct_rate,
+                    "avg_logprob": avg_logprob,
                     "true_output": true_outputs[i],
                     "samples": sample_results
                 })
@@ -613,8 +881,11 @@ def evaluate_batch_with_sampling(model, tokenizer, problem_ids: list[int],
                     "problem_id": problem_id,
                     "error": str(problem_error),
                     "any_correct": False,
+                    "best_sample_idx": -1,
+                    "highest_logprob_idx": -1,
                     "correct_count": 0,
                     "correct_rate": 0.0,
+                    "avg_logprob": -20.0,
                     "samples": []
                 })
         
@@ -657,8 +928,11 @@ def evaluate_batch_with_sampling(model, tokenizer, problem_ids: list[int],
             "problem_id": pid,
             "error": str(batch_error),
             "any_correct": False,
+            "best_sample_idx": -1,
+            "highest_logprob_idx": -1,
             "correct_count": 0,
             "correct_rate": 0.0,
+            "avg_logprob": -20.0,
             "samples": []
         } for pid in problem_ids]
 
@@ -770,21 +1044,28 @@ def evaluate_cruxeval(persona: str = "", trial_num: int | None = None):
                 formatted_batch_results = []
                 for i, result_tuple in enumerate(batch_results):
                     # Ensure the tuple has the expected number of elements
-                    if len(result_tuple) == 4:
-                        is_correct, full_generated_text, generated, true_out = result_tuple
+                    if len(result_tuple) >= 5:  # Updated to expect at least 5 elements
+                        is_correct, full_generated_text, generated, true_out, token_logprobs, logprob_stats = result_tuple
+                        mean_logprob = logprob_stats.get("mean", 0.0) if logprob_stats else 0.0
+                        
                         formatted_batch_results.append({
                             "problem_id": problem_ids[i],
                             "any_correct": is_correct,
                             "best_sample_idx": 0 if is_correct else -1,
+                            "highest_logprob_idx": 0,  # Only one sample, so it's the highest by default
                             "correct_count": 1 if is_correct else 0,
                             "correct_rate": 1.0 if is_correct else 0.0,
+                            "avg_logprob": mean_logprob,
                             "true_output": true_out,
                             "samples": [{
                                 "sample_idx": 0,
                                 "generated": generated,
                                 "full_generated_text": full_generated_text,
                                 "is_correct": is_correct,
-                                "num_tokens": len(generated_tokens)
+                                "token_logprobs": token_logprobs,
+                                "mean_logprob": mean_logprob,
+                                "num_tokens": len(tokenizer.encode(generated)),
+                                "logprob_stats": logprob_stats
                             }]
                         })
                     else:
@@ -793,8 +1074,10 @@ def evaluate_cruxeval(persona: str = "", trial_num: int | None = None):
                             "problem_id": problem_ids[i],
                             "any_correct": False,
                             "best_sample_idx": -1,
+                            "highest_logprob_idx": -1,
                             "correct_count": 0,
                             "correct_rate": 0.0,
+                            "avg_logprob": 0.0,
                             "error": f"FormatError: {result_tuple}",
                             "samples": []
                         })
@@ -829,8 +1112,21 @@ def evaluate_cruxeval(persona: str = "", trial_num: int | None = None):
                 correct_count = sum(1 for r in results if r.get("any_correct", False))
                 avg_correct_rate = sum(r.get("correct_rate", 0.0) for r in results) / processed_count
                 current_accuracy = correct_count / processed_count * 100
+                
+                # Calculate logprob statistics
+                avg_logprob = sum(r.get("avg_logprob", 0.0) for r in results) / processed_count
+                
+                # Count how often highest logprob sample is correct
+                logprob_match_count = sum(1 for r in results 
+                                          if r.get("highest_logprob_idx", -1) != -1 and 
+                                          r.get("samples") and 
+                                          r.get("samples")[r.get("highest_logprob_idx", 0)].get("is_correct", False))
+                logprob_match_rate = logprob_match_count / processed_count * 100
+                
                 print(f"Progress: {processed_count}/{num_problems}, Any Correct: {correct_count}/{processed_count} ({current_accuracy:.2f}%)")
-                print(f"Average correct rate across all problems: {avg_correct_rate:.4f} ({avg_correct_rate*100:.2f}%)\n")
+                print(f"Average correct rate across all problems: {avg_correct_rate:.4f} ({avg_correct_rate*100:.2f}%)")
+                print(f"Average logprob: {avg_logprob:.4f}")
+                print(f"Highest logprob sample is correct: {logprob_match_count}/{processed_count} ({logprob_match_rate:.2f}%)\n")
             else:
                 correct_count = sum(1 for r in results if r.get("any_correct", False))
                 current_accuracy = correct_count / processed_count * 100
@@ -869,9 +1165,32 @@ def evaluate_cruxeval(persona: str = "", trial_num: int | None = None):
         # Calculate problems with high consistency (>= 50% correct rate)
         high_consistency_count = sum(1 for r in results if r.get("correct_rate", 0.0) >= 0.5)
         
+        # Calculate logprob statistics
+        avg_logprob = sum(r.get("avg_logprob", 0.0) for r in results) / num_problems if num_problems > 0 else 0.0
+        
+        # Count how often highest logprob sample is correct
+        logprob_match_count = sum(1 for r in results 
+                                  if r.get("highest_logprob_idx", -1) != -1 and 
+                                  r.get("samples") and 
+                                  r.get("samples")[r.get("highest_logprob_idx", 0)].get("is_correct", False))
+        logprob_match_rate = logprob_match_count / num_problems * 100 if num_problems > 0 else 0.0
+        
+        # Calculate correlation between logprob and correctness
+        correct_logprobs = [r.get("avg_logprob", 0.0) for r in results if r.get("any_correct", False)]
+        incorrect_logprobs = [r.get("avg_logprob", 0.0) for r in results if not r.get("any_correct", False)]
+        avg_correct_logprob = sum(correct_logprobs) / len(correct_logprobs) if correct_logprobs else 0.0
+        avg_incorrect_logprob = sum(incorrect_logprobs) / len(incorrect_logprobs) if incorrect_logprobs else 0.0
+        
         print(f"Final accuracy with {num_samples} samples: {correct_count}/{num_problems} ({accuracy*100:.2f}%)")
         print(f"Average correct rate across all problems: {avg_correct_rate:.4f} ({avg_correct_rate*100:.2f}%)")
         print(f"Problems with ≥50% correct rate: {high_consistency_count}/{num_problems} ({high_consistency_count/num_problems*100:.2f}%)")
+        print(f"Average logprob: {avg_logprob:.4f}")
+        print(f"Highest logprob sample is correct: {logprob_match_count}/{num_problems} ({logprob_match_rate:.2f}%)")
+        
+        if correct_logprobs and incorrect_logprobs:
+            print(f"Average logprob for correct problems: {avg_correct_logprob:.4f}")
+            print(f"Average logprob for incorrect problems: {avg_incorrect_logprob:.4f}")
+            print(f"Logprob gap (correct - incorrect): {avg_correct_logprob - avg_incorrect_logprob:.4f}")
         
         # Calculate greedy accuracy (first sample only)
         greedy_correct = sum(1 for r in results if r.get("samples") and len(r.get("samples", [])) > 0 and r.get("samples")[0].get("is_correct", False))

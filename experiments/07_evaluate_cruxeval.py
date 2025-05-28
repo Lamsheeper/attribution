@@ -148,7 +148,7 @@ tokenizer = AutoTokenizer.from_pretrained(
     trust_remote_code=True
 )
 
-CONFIG = AutoConfig.from_pretrained(model_name)
+CONFIG = AutoConfig.from_pretrained(model_name, revision=revision)
 # Initialize model with optimized settings
 model = AutoModelForCausalLM.from_pretrained(
     model_name,

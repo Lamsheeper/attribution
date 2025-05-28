@@ -85,9 +85,9 @@ from urllib.parse import urlparse
 from olmo.train import Trainer
 
 load_path = "https://olmo-checkpoints.org/ai2-llm/peteish13/stage2/olmo-13b-1124_stage2_ingredient1/step1000-unsharded/"
-parsed = urlparse(str(dir))
+parsed = urlparse(str(load_path))
 
-trainer = Trainer(re
+trainer = Trainer()
 
 trainer.restore_checkpoint(load_path)
 
@@ -161,3 +161,81 @@ print(")")
 # model = AutoModelForCausalLM.from_pretrained("allenai/OLMo-2-1124-7B", revision=revision)
 
 #%%
+
+# Function to get all stage 1 checkpoints and sort them by steps/tokens
+def get_stage1_checkpoints(model_name="allenai/OLMo-2-1124-13B", sort_by="tokens", limit=None):
+    """
+    Get all stage 1 checkpoints for a given model.
+    
+    Args:
+        model_name: HuggingFace model name
+        sort_by: Sort by 'tokens', 'steps', or None for no sorting
+        limit: Maximum number of checkpoints to return, None for all
+    
+    Returns:
+        DataFrame with checkpoint information
+    """
+    import pandas as pd
+    
+    branches = print_branches(model_name, printing=False)
+    stage1_branches = [b for b in branches if "stage1" in b]
+    
+    # Extract data for each branch
+    data = [extract_stage_and_tokens(branch) for branch in stage1_branches]
+    
+    # Create DataFrame
+    df = pd.DataFrame(data, columns=['revision', 'stage', 'step', 'tokens'])
+    
+    # Sort if requested
+    if sort_by == "tokens":
+        df = df.sort_values(by="tokens", ascending=False)
+    elif sort_by == "steps":
+        df = df.sort_values(by="step", ascending=False)
+    
+    # Limit if requested
+    if limit:
+        df = df.head(limit)
+        
+    return df
+
+#%%
+# Example usage
+stage1_df = get_stage1_checkpoints(sort_by="tokens")
+print(f"Found {len(stage1_df)} stage 1 checkpoints")
+stage1_df.head(10)  # Display top 10 checkpoints
+
+#%%
+# Load a specific stage 1 checkpoint
+def load_stage1_model(model_name="allenai/OLMo-2-1124-13B", revision=None):
+    """
+    Load a specific stage 1 checkpoint.
+    If revision is None, loads the checkpoint with the highest token count.
+    
+    Args:
+        model_name: HuggingFace model name
+        revision: Specific revision to load, or None for highest token count
+    
+    Returns:
+        model, tokenizer tuple
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+    
+    if revision is None:
+        # Get the checkpoint with highest token count
+        df = get_stage1_checkpoints(model_name, sort_by="tokens", limit=1)
+        revision = df.iloc[0]['revision']
+    
+    print(f"Loading {model_name} with revision: {revision}")
+    
+    config = AutoConfig.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, 
+        revision=revision, 
+        config=config
+    )
+    
+    return model, tokenizer
+
+# Example: Load the stage 1 checkpoint with the highest token count
+# model, tokenizer = load_stage1_model()
